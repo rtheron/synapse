@@ -175,7 +175,7 @@ class SynapseMemoryProvider:
                 for _cat in _loaded:
                     self._remembered_facts.extend(_loaded[_cat])
                 _bullets = [f"- {f['content']}" for _fs in _loaded.values() for f in _fs]
-                logger.info(
+                logger.warning(
                     "Synapse hydrate OK: %d user_profile + %d environment facts:\n%s",
                     len(_loaded["user_profile"]), len(_loaded["environment"]),
                     "\n".join(_bullets) if _bullets else "(none found)",

@@ -100,6 +100,7 @@ class SynapseMemoryProvider:
             model=self._config.llm_model,
             base_url=self._config.llm_base_url,
             small_model=self._config.llm_model,
+            temperature=0, #@Nandou TODO: make configurable
         )
         self._graphiti = Graphiti(
             graph_driver=self._driver,
@@ -125,7 +126,7 @@ class SynapseMemoryProvider:
         future = asyncio.run_coroutine_threadsafe(
             self._graphiti.build_indices_and_constraints(), self._loop
         )
-        future.result(timeout=30)
+        future.result(timeout=480) # @Nandou TODO: make configurable
 
         # Initialize retrieval engine (BM25-only, no Graphiti needed)
         self._retrieval = RetrievalEngine(
@@ -134,6 +135,49 @@ class SynapseMemoryProvider:
             group_id=self._group_id,
             password=self._config.falkordb_password,
         )
+
+        # Hydrate the prompt cache from the graph — one-time per init.
+        # system_prompt_block() reads _remembered_facts (RAM only); without this
+        # step every process start renders an empty block no matter what the
+        # graph holds. Facts come from Explicit episode content, NOT RELATES_TO
+        # edges — identity channel, not recall channel.
+        # @Nandou TODO: Make Execution optional with config
+        try:
+            from synapse.falkor import FalkorHelper
+            _hydrate_graph = FalkorHelper(
+                host=self._config.falkordb_host,
+                port=self._config.falkordb_port,
+                password=self._config.falkordb_password,
+            ).get_graph(self._group_id)
+            _loaded = {"user_profile": [], "environment": []}
+            for _cat in _loaded:
+                _res = _hydrate_graph.query(
+                    "MATCH (e:Episodic) WHERE e.name = $name "
+                    "RETURN e.content ORDER BY e.valid_at DESC LIMIT 10",
+                    {"name": f"Explicit memory: {_cat}"},
+                )
+                _seen = set()
+                if _res and _res.result_set:
+                    for _row in _res.result_set:
+                        _content = _row[0]
+                        if _content and _content not in _seen:
+                            _seen.add(_content)
+                            _loaded[_cat].append({
+                                "content": _content,
+                                "category": _cat,
+                                "timestamp": "hydrated-from-graph",
+                            })
+            for _cat in _loaded:
+                self._remembered_facts.extend(_loaded[_cat])
+            _bullets = [f"- {f['content']}" for _fs in _loaded.values() for f in _fs]
+            logger.warning(
+                "Synapse hydrate OK: %d user_profile + %d environment facts:\n%s",
+                len(_loaded["user_profile"]), len(_loaded["environment"]),
+                "\n".join(_bullets) if _bullets else "(none found)",
+            )
+        except Exception as _e:
+            # Covered and non-fatal — provider still initializes without hydration
+            logger.warning("Synapse hydrate FAILED (non-fatal): %s", _e)
 
         # Initialize turn buffer (batch ingestion)
         self._turn_buffer = TurnBuffer(
@@ -247,7 +291,7 @@ class SynapseMemoryProvider:
                     ),
                     self._loop,
                 )
-                future.result(timeout=120)
+                future.result(timeout=600)  # @Nandou TODO: make configurable
 
                 if self._hippocampus:
                     from synapse.falkor import FalkorHelper
@@ -267,12 +311,16 @@ class SynapseMemoryProvider:
                         existing_entities=existing_entities,
                         new_edges=[],
                         existing_edges=recent_edges,
-                    )
+            except TimeoutError:
+            logger.warning(
+                "Synapse add_episode episode ingestion failed: TimeoutError "
+                "(add_episode exceeded 600s)"
+            )
             except Exception as e:
                 logger.warning(f"Synapse episode ingestion failed: {e}")
-
-        threading.Thread(target=_bg_ingest, daemon=True).start()
-
+        #threading.Thread(target=_bg_ingest, daemon=True).start()
+        # threading removed to sequence memory writes on slower
+        # local models @Nandou TODO: make configurable
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         """Return all Synapse tool schemas (synapse_query + synapse_remember).
 
@@ -369,34 +417,73 @@ class SynapseMemoryProvider:
         return json.dumps({"error": f"Unknown tool: {tool_name}"})
 
     def _store_remembered_fact(self, content: str, category: str) -> bool:
-        """Store an explicit fact in the graph with maximum salience."""
+
+#        """Store an explicit fact in the graph with maximum salience."""
+#        self._remembered_facts.append({
+#            "content": content,
+#            "category": category,
+#            "timestamp": datetime.now(timezone.utc).isoformat(),
+#        })
+#
+#        if self._graphiti and self._loop:
+#            def _bg_remember():
+#                try:
+#                    from graphiti_core.nodes import EpisodeType
+#                    future = asyncio.run_coroutine_threadsafe(
+#                        self._graphiti.add_episode(
+#                            name=f"Explicit memory: {category}",
+#                            episode_body=content,
+#                            source_description=f"Agent explicit memory write ({category})",
+#                            reference_time=datetime.now(timezone.utc),
+#                            source=EpisodeType.message,
+#                            group_id=self._group_id,
+#                        ),
+#                        self._loop,
+#                    )
+#                    future.result(timeout=60)
+#                except Exception as e:
+#                    logger.warning(f"Synapse remember ingestion failed: {e}")
+#
+#           threading.Thread(target=_bg_remember, daemon=True).start()
+            # @Nandou TODO: make configurable - either silent or intentionally queued
+        """Store an explicit fact in the graph no longer with maximum salience.
+
+        Waits for add_episode (no background detach) so failures return to
+        the tool and agents cannot flood parallel Graphiti writes.
+        """
+        if not self._graphiti or not self._loop:
+            logger.warning("Synapse remember failed: graphiti/loop not ready")
+            return False
+
+        try:
+            from graphiti_core.nodes import EpisodeType
+            future = asyncio.run_coroutine_threadsafe(
+                self._graphiti.add_episode(
+                    name=f"Explicit memory: {category}",
+                    episode_body=content,
+                    source_description=f"Agent explicit memory write ({category})",
+                    reference_time=datetime.now(timezone.utc),
+                    source=EpisodeType.message,
+                    group_id=self._group_id,
+                ),
+                self._loop,
+            )
+            future.result(timeout=460)
+        except TimeoutError:
+            logger.warning(
+                "Synapse remember failed: TimeoutError "
+                "(add_episode exceeded 460s)"
+            )
+            return False
+        except Exception as e:
+            logger.warning(f"Synapse remember ingestion failed: {e}")
+            return False
+
         self._remembered_facts.append({
             "content": content,
             "category": category,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         })
-
-        if self._graphiti and self._loop:
-            def _bg_remember():
-                try:
-                    from graphiti_core.nodes import EpisodeType
-                    future = asyncio.run_coroutine_threadsafe(
-                        self._graphiti.add_episode(
-                            name=f"Explicit memory: {category}",
-                            episode_body=content,
-                            source_description=f"Agent explicit memory write ({category})",
-                            reference_time=datetime.now(timezone.utc),
-                            source=EpisodeType.message,
-                            group_id=self._group_id,
-                        ),
-                        self._loop,
-                    )
-                    future.result(timeout=60)
-                except Exception as e:
-                    logger.warning(f"Synapse remember ingestion failed: {e}")
-
-            threading.Thread(target=_bg_remember, daemon=True).start()
-
         return True
 
     def shutdown(self) -> None:
@@ -412,7 +499,7 @@ class SynapseMemoryProvider:
                 future = asyncio.run_coroutine_threadsafe(
                     self._graphiti.close(), self._loop
                 )
-                future.result(timeout=10)
+                future.result(timeout=120)  # @Nandou TODO: make configurable
             except Exception:
                 pass
 
@@ -448,25 +535,25 @@ class SynapseMemoryProvider:
         if not self._graphiti or not self._loop:
             return
 
-        def _bg_write():
-            try:
-                from graphiti_core.nodes import EpisodeType
-                future = asyncio.run_coroutine_threadsafe(
-                    self._graphiti.add_episode(
-                        name=f"Memory: {action} {target}",
-                        episode_body=content,
-                        source_description=f"Hermes memory write ({action} on {target})",
-                        reference_time=datetime.now(timezone.utc),
-                        source=EpisodeType.message,
-                        group_id=self._group_id,
-                    ),
-                    self._loop,
-                )
-                future.result(timeout=30)
-            except Exception as e:
-                logger.debug(f"Synapse on_memory_write failed: {e}")
+        # Wait for Graphiti (no background detach).
+        try:
+            from graphiti_core.nodes import EpisodeType
+            future = asyncio.run_coroutine_threadsafe(
+                self._graphiti.add_episode(
+                    name=f"Memory: {action} {target}",
+                    episode_body=content,
+                    source_description=f"Hermes memory write ({action} on {target})",
+                    reference_time=datetime.now(timezone.utc),
+                    source=EpisodeType.message,
+                    group_id=self._group_id,
+                ),
+                self._loop,
+            )
+            future.result(timeout=120)
+        except Exception as e:
+            logger.warning(f"Synapse on_memory_write failed: {e}")
 
-        threading.Thread(target=_bg_write, daemon=True).start()
+    #threading.Thread(target=_bg_write, daemon=True).start()   # @Nandou TODO: make configurable - either silent or intentionally queued
 
     # -- Config --------------------------------------------------------------
 

@@ -460,7 +460,8 @@ class SynapseMemoryProvider:
                 logger.warning(f"Synapse remember ingestion failed: {e}")
                 return False
 
-        if self._config.sync_writes:
+        sync = self._config.sync_writes if self._config else False
+        if sync:
             if not self._graphiti or not self._loop:
                 logger.warning("Synapse remember failed: graphiti/loop not ready")
                 return False

@@ -17,10 +17,13 @@ Optimizations baked in:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
+import re
 import threading
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -131,7 +134,7 @@ class SynapseMemoryProvider:
         future = asyncio.run_coroutine_threadsafe(
             self._graphiti.build_indices_and_constraints(), self._loop
         )
-        future.result(timeout=self._config.init_timeout)
+        future.result(timeout=self._timeout_seconds(30))
 
         # Initialize retrieval engine (BM25-only, no Graphiti needed)
         self._retrieval = RetrievalEngine(
@@ -209,6 +212,146 @@ class SynapseMemoryProvider:
         asyncio.set_event_loop(self._loop)
         self._loop.run_forever()
 
+    def _env_bool(self, name: str, default: bool = False) -> bool:
+        value = os.environ.get(name)
+        if value is None:
+            return default
+        return value.lower() in ("1", "true", "yes")
+
+    def _write_failure_log_level(self) -> str:
+        level = os.environ.get("SYNAPSE_WRITE_FAILURE_LOG_LEVEL", "warning").lower()
+        return level if level in ("warning", "error") else "warning"
+
+    def _timeout_log_level(self) -> str:
+        level = os.environ.get("SYNAPSE_TIMEOUT_LOG_LEVEL", "0").lower()
+        return level if level in ("0", "warn", "error") else "0"
+
+    def _retry_queue_dir(self) -> Optional[str]:
+        return os.environ.get("SYNAPSE_RETRY_QUEUE_DIR") or None
+
+    def _surface_not_ready_failures(self) -> bool:
+        """Whether to surface write drops that upstream kept silent."""
+        return self._env_bool("SYNAPSE_SURFACE_WRITE_FAILURES") or self._retry_queue_dir() is not None
+
+    def _timeout_multiplier(self) -> float:
+        try:
+            return float(os.environ.get("SYNAPSE_TIMEOUT_MULTIPLIER", "1"))
+        except ValueError:
+            return 1.0
+
+    def _timeout_seconds(self, base_seconds: int) -> int:
+        return int(base_seconds * self._timeout_multiplier())
+
+    def _build_write_request(
+        self,
+        operation: str,
+        *,
+        name: str,
+        episode_body: str,
+        source_description: str,
+        reference_time: datetime,
+        timeout: int,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Build the exact serializable write request submitted to Graphiti."""
+        request: Dict[str, Any] = {
+            "operation": operation,
+            "name": name,
+            "episode_body": episode_body,
+            "source_description": source_description,
+            "reference_time": reference_time.isoformat(),
+            "source": "message",
+            "group_id": self._group_id,
+            "timeout": timeout,
+        }
+        if metadata is not None:
+            request["metadata"] = metadata
+        return request
+
+    def _submit_write_request(self, request: Dict[str, Any]) -> None:
+        """Submit a queued/current write request to Graphiti.
+
+        Raises on failure so callers can route through _record_write_failure().
+        """
+        if not self._graphiti or not self._loop:
+            raise RuntimeError("graphiti/loop not ready")
+
+        from graphiti_core.nodes import EpisodeType
+
+        future = asyncio.run_coroutine_threadsafe(
+            self._graphiti.add_episode(
+                name=request["name"],
+                episode_body=request["episode_body"],
+                source_description=request["source_description"],
+                reference_time=datetime.fromisoformat(request["reference_time"]),
+                source=EpisodeType.message,
+                group_id=request["group_id"],
+            ),
+            self._loop,
+        )
+        future.result(timeout=request["timeout"])
+
+    def _queue_write_failure(
+        self,
+        operation: str,
+        error: BaseException,
+        request: Dict[str, Any],
+    ) -> None:
+        retry_queue_dir = self._retry_queue_dir()
+        if retry_queue_dir is None:
+            return
+        try:
+            queue_path = Path(retry_queue_dir)
+            queue_path.mkdir(parents=True, exist_ok=True)
+
+            failed_at = datetime.now(timezone.utc)
+            canonical_request = json.dumps(
+                request,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            )
+            digest = hashlib.sha256(canonical_request.encode("utf-8")).hexdigest()[:16]
+            operation_safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", operation).strip("_") or "write"
+            filename = (
+                f"{failed_at.strftime('%Y%m%dT%H%M%S%fZ')}_"
+                f"{operation_safe}_{digest}_{uuid.uuid4().hex[:8]}.json"
+            )
+            final_path = queue_path / filename
+            tmp_path = queue_path / f"{filename}.tmp"
+            payload = {
+                "failed_at": failed_at.isoformat(),
+                "operation": operation,
+                "error": str(error),
+                "error_type": type(error).__name__,
+                "request": request,
+            }
+            tmp_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
+            os.replace(tmp_path, final_path)
+        except Exception as queue_error:
+            logger.error("Synapse failed-write queue error: %s", queue_error)
+
+    def _record_write_failure(
+        self,
+        operation: str,
+        error: BaseException,
+        request: Dict[str, Any],
+    ) -> None:
+        """Surface a non-timeout write failure and optionally persist it."""
+        log = logger.error if self._write_failure_log_level() == "error" else logger.warning
+        log("Synapse %s failed: %s", operation, error)
+        self._queue_write_failure(operation, error, request)
+
+    def _record_timeout_failure(self, operation: str, request: Dict[str, Any]) -> None:
+        """Record a timeout; timeout logging is controlled separately."""
+        error = TimeoutError(f"add_episode exceeded {request['timeout']}s")
+        level = self._timeout_log_level()
+        if level == "warn":
+            logger.warning("Synapse %s timed out: %s", operation, error)
+        elif level == "error":
+            logger.error("Synapse %s timed out: %s", operation, error)
+        self._queue_write_failure(operation, error, request)
+
     def system_prompt_block(self) -> str:
         """Static info for the system prompt — brain-aware."""
         if not self._initialized:
@@ -275,30 +418,37 @@ class SynapseMemoryProvider:
 
     def _ingest_episode(self) -> None:
         """Flush the turn buffer and ingest as a batch episode."""
-        if not self._turn_buffer or not self._graphiti or not self._loop:
+        if not self._turn_buffer:
+            return
+        if (not self._graphiti or not self._loop) and not self._surface_not_ready_failures():
             return
 
         episode = self._turn_buffer.flush()
         if not episode:
             return
 
+        request = self._build_write_request(
+            "episode_ingest",
+            name=episode["name"],
+            episode_body=episode["body"],
+            source_description="Hermes agent conversation",
+            reference_time=episode["reference_time"],
+            timeout=self._timeout_seconds(120),
+            metadata={"turn_count": episode.get("turn_count")},
+        )
+
         def _bg_ingest():
             try:
-                from graphiti_core.nodes import EpisodeType
-                future = asyncio.run_coroutine_threadsafe(
-                    self._graphiti.add_episode(
-                        name=episode["name"],
-                        episode_body=episode["body"],
-                        source_description="Hermes agent conversation",
-                        reference_time=episode["reference_time"],
-                        source=EpisodeType.message,
-                        group_id=self._group_id,
-                    ),
-                    self._loop,
-                )
-                future.result(timeout=self._config.episode_timeout)
+                self._submit_write_request(request)
+            except TimeoutError:
+                self._record_timeout_failure("episode_ingest", request)
+                return
+            except Exception as e:
+                self._record_write_failure("episode_ingest", e, request)
+                return
 
-                if self._hippocampus:
+            if self._hippocampus:
+                try:
                     from synapse.falkor import FalkorHelper
                     helper = FalkorHelper(
                         host=self._config.falkordb_host,
@@ -317,20 +467,19 @@ class SynapseMemoryProvider:
                         new_edges=[],
                         existing_edges=recent_edges,
                     )
-            except TimeoutError:
-                logger.warning(
-                    "Synapse episode ingestion failed: TimeoutError "
-                    "(add_episode exceeded %ss)", self._config.episode_timeout
-                )
-            except Exception as e:
-                logger.warning(f"Synapse episode ingestion failed: {e}")
+                except Exception as e:
+                    logger.warning("Synapse post-episode processing failed: %s", e)
 
-        if self._config.sync_writes:
+        sync = self._config.sync_writes if self._config else False
+        if sync:
             # Sequenced write — waits for Graphiti so slow local LLMs are not
             # flooded with parallel episode writes.
             _bg_ingest()
-        else:
+        elif self._graphiti and self._loop:
             threading.Thread(target=_bg_ingest, daemon=True).start()
+        else:
+            _bg_ingest()
+
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         """Return all Synapse tool schemas (synapse_query + synapse_remember).
 
@@ -434,35 +583,32 @@ class SynapseMemoryProvider:
         enabled, waits for add_episode (no background detach) so failures
         return to the tool and agents cannot flood parallel Graphiti writes.
         """
+        request = self._build_write_request(
+            "remember",
+            name=f"Explicit memory: {category}",
+            episode_body=content,
+            source_description=f"Agent explicit memory write ({category})",
+            reference_time=datetime.now(timezone.utc),
+            timeout=self._timeout_seconds(60),
+        )
+
         def _write() -> bool:
             try:
-                from graphiti_core.nodes import EpisodeType
-                future = asyncio.run_coroutine_threadsafe(
-                    self._graphiti.add_episode(
-                        name=f"Explicit memory: {category}",
-                        episode_body=content,
-                        source_description=f"Agent explicit memory write ({category})",
-                        reference_time=datetime.now(timezone.utc),
-                        source=EpisodeType.message,
-                        group_id=self._group_id,
-                    ),
-                    self._loop,
-                )
-                future.result(timeout=self._config.remember_timeout)
+                self._submit_write_request(request)
                 return True
             except TimeoutError:
-                logger.warning(
-                    "Synapse remember failed: TimeoutError "
-                    "(add_episode exceeded %ss)", self._config.remember_timeout
-                )
+                self._record_timeout_failure("remember", request)
                 return False
             except Exception as e:
-                logger.warning(f"Synapse remember ingestion failed: {e}")
+                self._record_write_failure("remember", e, request)
                 return False
 
         sync = self._config.sync_writes if self._config else False
         if sync:
-            if not self._graphiti or not self._loop:
+            if (
+                (not self._graphiti or not self._loop)
+                and not self._surface_not_ready_failures()
+            ):
                 logger.warning("Synapse remember failed: graphiti/loop not ready")
                 return False
             if not _write():
@@ -481,6 +627,8 @@ class SynapseMemoryProvider:
         })
         if self._graphiti and self._loop:
             threading.Thread(target=_write, daemon=True).start()
+        elif self._surface_not_ready_failures():
+            _write()
         return True
 
     def shutdown(self) -> None:
@@ -496,7 +644,7 @@ class SynapseMemoryProvider:
                 future = asyncio.run_coroutine_threadsafe(
                     self._graphiti.close(), self._loop
                 )
-                future.result(timeout=self._config.close_timeout)
+                future.result(timeout=self._timeout_seconds(10))
             except Exception:
                 pass
 
@@ -529,32 +677,35 @@ class SynapseMemoryProvider:
             self._native_memory_active = True
             logger.debug("Synapse: native memory detected — switching to supplementary mode")
 
-        if not self._graphiti or not self._loop:
+        if (not self._graphiti or not self._loop) and not self._surface_not_ready_failures():
             return
+
+        request = self._build_write_request(
+            "memory_write",
+            name=f"Memory: {action} {target}",
+            episode_body=content,
+            source_description=f"Hermes memory write ({action} on {target})",
+            reference_time=datetime.now(timezone.utc),
+            timeout=self._timeout_seconds(30),
+            metadata=metadata,
+        )
 
         def _bg_write():
             try:
-                from graphiti_core.nodes import EpisodeType
-                future = asyncio.run_coroutine_threadsafe(
-                    self._graphiti.add_episode(
-                        name=f"Memory: {action} {target}",
-                        episode_body=content,
-                        source_description=f"Hermes memory write ({action} on {target})",
-                        reference_time=datetime.now(timezone.utc),
-                        source=EpisodeType.message,
-                        group_id=self._group_id,
-                    ),
-                    self._loop,
-                )
-                future.result(timeout=self._config.memory_write_timeout)
+                self._submit_write_request(request)
+            except TimeoutError:
+                self._record_timeout_failure("memory_write", request)
             except Exception as e:
-                logger.warning(f"Synapse on_memory_write failed: {e}")
+                self._record_write_failure("memory_write", e, request)
 
-        if self._config.sync_writes:
+        sync = self._config.sync_writes if self._config else False
+        if sync:
             # Sequenced write — waits for Graphiti (no background detach).
             _bg_write()
-        else:
+        elif self._graphiti and self._loop:
             threading.Thread(target=_bg_write, daemon=True).start()
+        else:
+            _bg_write()
 
     # -- Config --------------------------------------------------------------
 

@@ -23,6 +23,7 @@ class SynapseConfig:
     # LLM config (OpenAI-compatible endpoint)
     llm_api_key: str = ""
     llm_base_url: str = ""
+    embedding_base_url: str = ""           # empty = use llm_base_url
     llm_model: str = "gpt-4o-mini"
     embedding_model: str = "text-embedding-3-small"
 
@@ -63,6 +64,7 @@ class SynapseConfig:
             falkordb_database=os.environ.get("SYNAPSE_DATABASE", "synapse"),
             llm_api_key=os.environ.get("SYNAPSE_LLM_API_KEY", ""),
             llm_base_url=os.environ.get("SYNAPSE_LLM_BASE_URL", ""),
+            embedding_base_url=os.environ.get("SYNAPSE_EMBEDDING_BASE_URL", ""),
             llm_model=os.environ.get("SYNAPSE_LLM_MODEL", "gpt-4o-mini"),
             embedding_model=os.environ.get("SYNAPSE_EMBEDDING_MODEL", "text-embedding-3-small"),
             batch_size=int(os.environ.get("SYNAPSE_BATCH_SIZE", "5")),

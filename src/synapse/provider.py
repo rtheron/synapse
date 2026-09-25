@@ -119,7 +119,7 @@ class SynapseMemoryProvider:
             ),
             embedder=OpenAIEmbedder(config=OpenAIEmbedderConfig(
                 api_key=self._config.llm_api_key,
-                base_url=self._config.llm_base_url,
+                base_url=self._config.embedding_base_url or self._config.llm_base_url,
                 embedding_model=self._config.embedding_model,
             )),
             cross_encoder=OpenAIRerankerClient(config=llm_config),
@@ -726,6 +726,8 @@ class SynapseMemoryProvider:
              "env_var": "SYNAPSE_LLM_MODEL", "default": "gpt-4o-mini"},
             {"key": "embedding_model", "description": "Embedding model", "required": False,
              "env_var": "SYNAPSE_EMBEDDING_MODEL", "default": "text-embedding-3-small"},
+            {"key": "embedding_base_url", "description": "Embedding base URL (defaults to LLM base URL)",
+             "required": False, "env_var": "SYNAPSE_EMBEDDING_BASE_URL"},
             {"key": "batch_size", "description": "Turns per episode (optimization)",
              "required": False, "env_var": "SYNAPSE_BATCH_SIZE", "default": "5"},
             {"key": "half_life_days", "description": "Forgetting curve half-life in days",
